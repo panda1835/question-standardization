@@ -12,9 +12,11 @@ type SourceQuestion = {
   id: string;
   text: string;
   occurrences: number;
-  standardId: string | null;
-  matchType: "manual" | "keyword" | null;
-  matchedKeyword?: string;
+  manualStandardIds: string[];
+  keywordMatches: {
+    standardId: string;
+    keyword: string;
+  }[];
 };
 
 function parseCsv(input: string) {
@@ -55,6 +57,21 @@ function normalize(value: string) {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function containsWholeKeyword(text: string, keyword: string) {
+  const normalizedKeyword = normalize(keyword);
+  if (!normalizedKeyword) return false;
+
+  const pattern = new RegExp(
+    `(?<![\\p{L}\\p{N}])${escapeRegExp(normalizedKeyword)}(?![\\p{L}\\p{N}])`,
+    "iu",
+  );
+  return pattern.test(normalize(text));
+}
+
 function csvCell(value: string | number) {
   return `"${String(value).replaceAll('"', '""')}"`;
 }
@@ -91,18 +108,29 @@ function splitAndDeduplicate(rows: string[][]) {
   return Array.from(unique.values());
 }
 
-function findKeywordMatch(text: string, standards: StandardQuestion[]) {
+function findKeywordMatches(text: string, standards: StandardQuestion[]) {
   const normalizedText = normalize(text);
+  const matches = new Map<string, { standardId: string; keyword: string }>();
 
-  return standards
-    .flatMap((standard) =>
-      standard.keywords.map((keyword) => ({
-        standardId: standard.id,
-        keyword,
-      })),
-    )
-    .filter(({ keyword }) => normalizedText.includes(normalize(keyword)))
-    .sort((first, second) => second.keyword.length - first.keyword.length)[0];
+  standards.forEach((standard) => {
+    const keyword = standard.keywords
+      .filter((item) => containsWholeKeyword(normalizedText, item))
+      .sort((first, second) => second.length - first.length)[0];
+    if (keyword) {
+      matches.set(standard.id, { standardId: standard.id, keyword });
+    }
+  });
+
+  return Array.from(matches.values());
+}
+
+function getAssignedStandardIds(question: SourceQuestion) {
+  return Array.from(
+    new Set([
+      ...question.manualStandardIds,
+      ...question.keywordMatches.map((match) => match.standardId),
+    ]),
+  );
 }
 
 export default function Home() {
@@ -127,7 +155,7 @@ export default function Home() {
     (standard) => standard.id === selectedStandardId,
   );
   const matchedCount = questions.filter(
-    (question) => question.standardId,
+    (question) => getAssignedStandardIds(question).length > 0,
   ).length;
   const unmatchedCount = questions.length - matchedCount;
 
@@ -146,8 +174,10 @@ export default function Home() {
       questions.filter((question) => {
         const matchesTab =
           activeTab === "all" ||
-          (activeTab === "matched" && question.standardId) ||
-          (activeTab === "unmatched" && !question.standardId);
+          (activeTab === "matched" &&
+            getAssignedStandardIds(question).length > 0) ||
+          (activeTab === "unmatched" &&
+            getAssignedStandardIds(question).length === 0);
         return (
           matchesTab &&
           question.text.toLowerCase().includes(questionSearch.toLowerCase())
@@ -184,6 +214,12 @@ export default function Home() {
       }));
 
     setStandards(imported);
+    setQuestions((current) =>
+      current.map((question) => ({
+        ...question,
+        keywordMatches: findKeywordMatches(question.text, imported),
+      })),
+    );
     setSelectedStandardId(imported[0]?.id || "");
     setStandardFilename(result.file.name);
     flash(`${imported.length} standards loaded`);
@@ -196,14 +232,12 @@ export default function Home() {
     const rows = parseCsv(result.text);
     const uniqueQuestions = splitAndDeduplicate(rows);
     const imported = uniqueQuestions.map((question, index) => {
-      const match = findKeywordMatch(question.text, standards);
       return {
         id: `question-${Date.now()}-${index}`,
         text: question.text,
         occurrences: question.occurrences,
-        standardId: match?.standardId || null,
-        matchType: match ? ("keyword" as const) : null,
-        matchedKeyword: match?.keyword,
+        manualStandardIds: [],
+        keywordMatches: findKeywordMatches(question.text, standards),
       };
     });
 
@@ -215,15 +249,31 @@ export default function Home() {
     );
   }
 
-  function assignQuestion(questionId: string, standardId: string) {
+  function addManualMatch(questionId: string, standardId: string) {
+    if (!standardId) return;
     setQuestions((current) =>
       current.map((question) =>
         question.id === questionId
           ? {
               ...question,
-              standardId: standardId || null,
-              matchType: standardId ? "manual" : null,
-              matchedKeyword: undefined,
+              manualStandardIds: question.manualStandardIds.includes(standardId)
+                ? question.manualStandardIds
+                : [...question.manualStandardIds, standardId],
+            }
+          : question,
+      ),
+    );
+  }
+
+  function removeManualMatch(questionId: string, standardId: string) {
+    setQuestions((current) =>
+      current.map((question) =>
+        question.id === questionId
+          ? {
+              ...question,
+              manualStandardIds: question.manualStandardIds.filter(
+                (id) => id !== standardId,
+              ),
             }
           : question,
       ),
@@ -231,30 +281,16 @@ export default function Home() {
   }
 
   function applyAllKeywords(nextStandards = standards) {
-    let count = 0;
-
+    let mappingCount = 0;
     setQuestions((current) =>
       current.map((question) => {
-        if (question.standardId) return question;
-        const match = findKeywordMatch(question.text, nextStandards);
-        if (!match) return question;
-        count += 1;
-        return {
-          ...question,
-          standardId: match.standardId,
-          matchType: "keyword",
-          matchedKeyword: match.keyword,
-        };
+        const keywordMatches = findKeywordMatches(question.text, nextStandards);
+        mappingCount += keywordMatches.length;
+        return { ...question, keywordMatches };
       }),
     );
-
     window.setTimeout(
-      () =>
-        flash(
-          count
-            ? `${count} unmatched questions assigned by keyword`
-            : "No new keyword matches found",
-        ),
+      () => flash(`${mappingCount} keyword mappings applied`),
       0,
     );
   }
@@ -263,9 +299,7 @@ export default function Home() {
     const keyword = keywordDraft.trim();
     if (!keyword || !selectedStandardId) return;
 
-    let nextStandards = standards;
-    setStandards((current) => {
-      nextStandards = current.map((standard) =>
+    const nextStandards = standards.map((standard) =>
         standard.id === selectedStandardId &&
         !standard.keywords.some(
           (item) => normalize(item) === normalize(keyword),
@@ -273,61 +307,37 @@ export default function Home() {
           ? { ...standard, keywords: [...standard.keywords, keyword] }
           : standard,
       );
-      return nextStandards;
-    });
+    setStandards(nextStandards);
     setKeywordDraft("");
-
-    setQuestions((current) => {
-      let count = 0;
-      const nextQuestions = current.map((question) => {
-        if (
-          question.standardId ||
-          !normalize(question.text).includes(normalize(keyword))
-        ) {
-          return question;
-        }
-        count += 1;
-        return {
-          ...question,
-          standardId: selectedStandardId,
-          matchType: "keyword" as const,
-          matchedKeyword: keyword,
-        };
-      });
-      window.setTimeout(
-        () =>
-          flash(
-            count
-              ? `Keyword added and ${count} questions assigned`
-              : "Keyword added",
-          ),
-        0,
-      );
-      return nextQuestions;
-    });
+    applyAllKeywords(nextStandards);
   }
 
   function removeKeyword(keyword: string) {
-    setStandards((current) =>
-      current.map((standard) =>
+    const nextStandards = standards.map((standard) =>
         standard.id === selectedStandardId
           ? {
               ...standard,
               keywords: standard.keywords.filter((item) => item !== keyword),
             }
           : standard,
-      ),
     );
+    setStandards(nextStandards);
+    applyAllKeywords(nextStandards);
   }
 
   function exportMatches() {
     downloadCsv("question-matches.csv", [
       ["messed_up_question", "standard_question"],
-      ...questions.map((question) => [
-        question.text,
-        standards.find((standard) => standard.id === question.standardId)
-          ?.text || "",
-      ]),
+      ...questions.flatMap((question) => {
+        const assignedIds = getAssignedStandardIds(question);
+        return assignedIds.length
+          ? assignedIds.map((standardId) => [
+              question.text,
+              standards.find((standard) => standard.id === standardId)?.text ||
+                "",
+            ])
+          : [[question.text, ""]];
+      }),
     ]);
   }
 
@@ -340,9 +350,8 @@ export default function Home() {
         "standard_question",
         "keywords",
         "occurrences",
-        "matched_standard_id",
-        "match_type",
-        "matched_keyword",
+        "manual_standard_ids",
+        "keyword_matches",
       ],
       ...standards.map((standard) => [
         "standard",
@@ -350,7 +359,6 @@ export default function Home() {
         "",
         standard.text,
         standard.keywords.join("|"),
-        "",
         "",
         "",
         "",
@@ -362,9 +370,10 @@ export default function Home() {
         "",
         "",
         question.occurrences,
-        question.standardId || "",
-        question.matchType || "",
-        question.matchedKeyword || "",
+        question.manualStandardIds.join("|"),
+        question.keywordMatches
+          .map((match) => `${match.standardId}::${match.keyword}`)
+          .join("|"),
       ]),
     ]);
     flash("Workspace saved");
@@ -395,10 +404,16 @@ export default function Home() {
         id: value(row, "id"),
         text: value(row, "question"),
         occurrences: Number(value(row, "occurrences")) || 1,
-        standardId: value(row, "matched_standard_id") || null,
-        matchType: (value(row, "match_type") ||
-          null) as SourceQuestion["matchType"],
-        matchedKeyword: value(row, "matched_keyword") || undefined,
+        manualStandardIds: value(row, "manual_standard_ids")
+          .split("|")
+          .filter(Boolean),
+        keywordMatches: value(row, "keyword_matches")
+          .split("|")
+          .filter(Boolean)
+          .map((match) => {
+            const [standardId, keyword = ""] = match.split("::");
+            return { standardId, keyword };
+          }),
       }));
 
     setStandards(restoredStandards);
@@ -525,7 +540,9 @@ export default function Home() {
             <h3 className="text-lg font-semibold">Filter keywords</h3>
 
             <p className="mt-2 text-base font-medium italic">
-              "{selectedStandard?.text || "Select a standard question"}"
+              &ldquo;
+              {selectedStandard?.text || "Select a standard question"}
+              &rdquo;
             </p>
 
             <div className="mt-4 flex flex-wrap gap-2">
@@ -580,7 +597,8 @@ export default function Home() {
             <div className="min-h-0 flex-1 overflow-y-auto">
               {visibleStandards.map((standard) => {
                 const assignedCount = questions.filter(
-                  (question) => question.standardId === standard.id,
+                  (question) =>
+                    getAssignedStandardIds(question).includes(standard.id),
                 ).length;
                 return (
                   <button
@@ -653,13 +671,11 @@ export default function Home() {
           ) : (
             <div className="min-h-0 flex-1 divide-y divide-slate-200 overflow-y-auto">
               {visibleQuestions.map((question) => {
-                const standard = standards.find(
-                  (item) => item.id === question.standardId,
-                );
+                const assignedStandardIds = getAssignedStandardIds(question);
                 return (
                   <article
                     key={question.id}
-                    className="grid gap-3 px-5 py-4 xl:grid-cols-[1fr_300px] xl:items-center"
+                    className="grid gap-4 px-5 py-4 xl:grid-cols-[minmax(0,1fr)_360px] xl:items-start"
                   >
                     <div className="min-w-0">
                       <p className="text-base leading-6">{question.text}</p>
@@ -667,39 +683,74 @@ export default function Home() {
                         {question.occurrences > 1 && (
                           <span>Appeared {question.occurrences} times</span>
                         )}
-                        {question.matchType === "keyword" && (
-                          <span className="text-blue-700">
-                            Matched by keyword “{question.matchedKeyword}”
-                          </span>
-                        )}
-                        {question.matchType === "manual" && (
-                          <span className="text-emerald-700">
-                            Manually matched
+                      </div>
+                    </div>
+                    <div className="min-w-0">
+                      <div className="mb-2 flex flex-wrap gap-2">
+                        {assignedStandardIds.map((standardId) => {
+                          const standard = standards.find(
+                            (item) => item.id === standardId,
+                          );
+                          if (!standard) return null;
+                          const keywordMatch = question.keywordMatches.find(
+                            (match) => match.standardId === standardId,
+                          );
+                          const isManual =
+                            question.manualStandardIds.includes(standardId);
+                          return (
+                            <span
+                              key={standardId}
+                              className={`inline-flex max-w-full items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm ${
+                                keywordMatch
+                                  ? "border-blue-300 bg-blue-50 text-blue-900"
+                                  : "border-emerald-300 bg-emerald-50 text-emerald-900"
+                              }`}
+                              title={standard.text}
+                            >
+                              <span className="truncate">
+                                {standard.text}
+                                {keywordMatch
+                                  ? ` · keyword: ${keywordMatch.keyword}`
+                                  : " · manual"}
+                              </span>
+                              {isManual && (
+                                <button
+                                  className="shrink-0 text-lg leading-none text-slate-500 hover:text-slate-900"
+                                  onClick={() =>
+                                    removeManualMatch(question.id, standardId)
+                                  }
+                                  aria-label={`Remove manual match to ${standard.text}`}
+                                >
+                                  ×
+                                </button>
+                              )}
+                            </span>
+                          );
+                        })}
+                        {!assignedStandardIds.length && (
+                          <span className="text-sm text-amber-700">
+                            Not matched
                           </span>
                         )}
                       </div>
-                    </div>
-                    <div>
-                      <label className="mb-1 block text-sm font-medium text-slate-600">
-                        Standard question
-                      </label>
                       <select
-                        className={`w-full rounded-md border px-3 py-2.5 text-base outline-none ${
-                          standard
-                            ? "border-emerald-500 bg-emerald-50"
-                            : "border-amber-500 bg-amber-50"
-                        }`}
-                        value={question.standardId || ""}
+                        className="w-full rounded-md border border-slate-400 bg-white px-3 py-2.5 text-base outline-none"
+                        value=""
                         onChange={(event) =>
-                          assignQuestion(question.id, event.target.value)
+                          addManualMatch(question.id, event.target.value)
                         }
                       >
-                        <option value="">Not matched</option>
-                        {standards.map((item) => (
-                          <option key={item.id} value={item.id}>
-                            {item.text}
-                          </option>
-                        ))}
+                        <option value="">Add a manual match...</option>
+                        {standards
+                          .filter(
+                            (item) =>
+                              !question.manualStandardIds.includes(item.id),
+                          )
+                          .map((item) => (
+                            <option key={item.id} value={item.id}>
+                              {item.text}
+                            </option>
+                          ))}
                       </select>
                     </div>
                   </article>
